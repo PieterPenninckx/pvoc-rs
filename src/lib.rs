@@ -35,6 +35,60 @@ impl Bin {
     }
 }
 
+// TODO: find a better name for this struct
+pub struct WindowedFft {
+    fft: Arc<dyn rustfft::FFT<f64>>,
+    input_buffer: Vec<c64>,
+    output_buffer: Vec<c64>,
+    window: Vec<f64>,
+}
+
+impl WindowedFft {
+    /// Create a new `WindowedFft` for forward FFT with the given window.
+    ///
+    /// # Example
+    /// ```
+    /// extern crate apodize;
+    ///
+    /// let window = apodize::hanning_iter(1024).collect();
+    //  let windowed_fft = WindowedFft::forward(window);
+    /// ```
+    ///
+    /// # Remark: cannot be used in a real-time context
+    /// This method allocates memory and cannot be used in a real-time context
+    pub fn forward(window: Vec<f64>) -> Self
+    {
+        Self::new(rustfft::FFTplanner::new(false), window)
+    }
+
+    /// Create a new `WindowedFft` for backward FFT with the given window.
+    ///
+    /// # Example
+    /// ```
+    /// extern crate apodize;
+    ///
+    /// let window = apodize::hanning_iter(frame_size).collect();
+    //  let windowed_fft = WindowedFft::backward(window);
+    /// ```
+    /// # Remark: cannot be used in a real-time context
+    /// This method allocates memory and cannot be used in a real-time context
+    pub fn backward(window: Vec<f64>) -> Self
+    {
+        Self::new(rustfft::FFTplanner::new(true), window)
+    }
+
+    fn new(mut planner: rustfft::FFTplanner<f64>, window: Vec<f64>) -> Self
+    {
+        let frame_size = window.len();
+        Self {
+            fft: planner.plan_fft(frame_size),
+            input_buffer: vec![c64::new(0.0, 0.0); frame_size],
+            output_buffer: vec![c64::new(0.0, 0.0); frame_size],
+            window
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PhaseVocoderSettings {
     sample_rate: f64,
