@@ -50,7 +50,7 @@ impl WindowedFft {
     /// ```
     /// extern crate apodize;
     ///
-    /// let window = apodize::hanning_iter(1024).collect();
+    /// let window : Vec<_> = apodize::hanning_iter(1024).collect();
     //  let windowed_fft = WindowedFft::forward(window);
     /// ```
     ///
@@ -67,7 +67,7 @@ impl WindowedFft {
     /// ```
     /// extern crate apodize;
     ///
-    /// let window = apodize::hanning_iter(frame_size).collect();
+    /// let window : Vec<_> = apodize::hanning_iter(1024).collect();
     //  let windowed_fft = WindowedFft::backward(window);
     /// ```
     /// # Remark: cannot be used in a real-time context
@@ -86,6 +86,10 @@ impl WindowedFft {
             output_buffer: vec![c64::new(0.0, 0.0); frame_size],
             window
         }
+    }
+
+    pub fn frame_size(&self) -> usize {
+        self.window.len()
     }
 }
 
@@ -170,27 +174,31 @@ impl PhaseVocoderAnalysis {
 
     /// Returns `true` when data has been written to the `analysis_out` parameter.
     /// Returns `false` when there are not enough samples available.
+    ///
+    /// # Panics
+    /// Panics if the frame size of `self` differs from the frame size of `windowed_fft`.
+    /// Panics if the frame size of `self` differs from the length of `analysis_out`.
     pub fn analyse(
         &mut self,
-        forward_fft: &dyn rustfft::FFT<f64>,
-        fft_in: &mut [c64],
-        fft_out: &mut [c64],
-        window: &[f64],
+        windowed_fft: &mut WindowedFft,
         analysis_out: &mut [Bin],
     ) -> bool {
+        assert_eq!(self.settings.frame_size, windowed_fft.frame_size());
+        assert_eq!(self.settings.frame_size, analysis_out.len());
+
         if self.in_buf.len() < self.settings.frame_size {
             return false;
         }
 
         // read in
         for i in 0..self.settings.frame_size {
-            fft_in[i] = c64::new(self.in_buf[i] * window[i], 0.0);
+            windowed_fft.input_buffer[i] = c64::new(self.in_buf[i] * windowed_fft.window[i], 0.0);
         }
 
-        forward_fft.process(fft_in, fft_out);
+        windowed_fft.fft.process(&mut windowed_fft.input_buffer, &mut windowed_fft.output_buffer);
 
         for i in 0..self.settings.frame_size {
-            let x = fft_out[i];
+            let x = windowed_fft.output_buffer[i];
             let (amp, phase) = x.to_polar();
             let freq = self
                 .settings
@@ -230,11 +238,8 @@ impl PhaseVocoderSynthesis {
 
     fn synthesize(
         &mut self,
-        backward_fft: &dyn rustfft::FFT<f64>,
-        fft_in: &mut [c64],
-        fft_out: &mut [c64],
+        windowed_fft: &mut WindowedFft,
         synthesis_in: &[Bin],
-        window: &[f64],
     ) {
         let frame_sizef = self.settings.frame_size as f64;
         let time_resf = self.settings.time_res as f64;
@@ -246,17 +251,17 @@ impl PhaseVocoderSynthesis {
             self.sum_phase[i] += phase;
             let phase = self.sum_phase[i];
 
-            fft_in[i] = c64::from_polar(&amp, &phase);
+            windowed_fft.input_buffer[i] = c64::from_polar(&amp, &phase);
         }
 
-        backward_fft.process(fft_in, fft_out);
+        windowed_fft.fft.process(&mut windowed_fft.input_buffer, &mut windowed_fft.output_buffer);
 
         // accumulate
         for i in 0..self.settings.frame_size {
             if i == self.output_accum.len() {
                 self.output_accum.push_back(0.0);
             }
-            self.output_accum[i] += window[i] * fft_out[i].re / (frame_sizef * time_resf);
+            self.output_accum[i] += windowed_fft.window[i] * windowed_fft.output_buffer[i].re / (frame_sizef * time_resf);
         }
 
         // write out
@@ -277,18 +282,14 @@ impl PhaseVocoderSynthesis {
 pub struct PhaseVocoder {
     channels: usize,
     settings: PhaseVocoderSettings,
+    samples_waiting: usize,
 
     analysis: Vec<PhaseVocoderAnalysis>,
     synthesis: Vec<PhaseVocoderSynthesis>,
 
-    samples_waiting: usize,
-    forward_fft: Arc<dyn rustfft::FFT<f64>>,
-    backward_fft: Arc<dyn rustfft::FFT<f64>>,
+    windowed_forward_fft: WindowedFft,
+    windowed_backward_fft: WindowedFft,
 
-    window: Vec<f64>,
-
-    fft_in: Vec<c64>,
-    fft_out: Vec<c64>,
     analysis_out: Vec<Vec<Bin>>,
     synthesis_in: Vec<Vec<Bin>>,
 }
@@ -320,9 +321,6 @@ impl PhaseVocoder {
     }
 
     fn from_settings(channels: usize, settings: PhaseVocoderSettings) -> Self {
-        let mut planner_forward = rustfft::FFTplanner::new(false);
-        let mut planner_backward = rustfft::FFTplanner::new(true);
-
         let mut analysis = Vec::new();
         let mut synthesis = Vec::new();
         for _ in 0..channels {
@@ -332,26 +330,27 @@ impl PhaseVocoder {
 
         let frame_size = settings.frame_size;
 
+        let analysis_window : Vec<_>= apodize::hanning_iter(frame_size)
+            .map(|x| x.sqrt())
+            .collect();
+        let synthesis_window = analysis_window.clone();
+        let windowed_forward_fft = WindowedFft::forward(analysis_window);
+        let windowed_backward_fft = WindowedFft::backward(synthesis_window);
+
         PhaseVocoder {
             channels,
             settings,
-
             samples_waiting: 0,
-
-            forward_fft: planner_forward.plan_fft(frame_size),
-            backward_fft: planner_backward.plan_fft(frame_size),
-
-            window: apodize::hanning_iter(frame_size)
-                .map(|x| x.sqrt())
-                .collect(),
-
-            fft_in: vec![c64::new(0.0, 0.0); frame_size],
-            fft_out: vec![c64::new(0.0, 0.0); frame_size],
-            analysis_out: vec![vec![Bin::empty(); frame_size]; channels],
-            synthesis_in: vec![vec![Bin::empty(); frame_size]; channels],
 
             analysis,
             synthesis,
+
+            windowed_forward_fft,
+            windowed_backward_fft,
+
+            analysis_out: vec![vec![Bin::empty(); frame_size]; channels],
+            synthesis_in: vec![vec![Bin::empty(); frame_size]; channels],
+
         }
     }
 
@@ -418,10 +417,7 @@ impl PhaseVocoder {
                 // ANALYSIS
                 for chan in 0..self.channels {
                     self.analysis[chan].analyse(
-                        self.forward_fft.as_ref(),
-                        &mut self.fft_in,
-                        &mut self.fft_out,
-                        &self.window,
+                        &mut self.windowed_forward_fft,
                         &mut self.analysis_out[chan],
                     );
                 }
@@ -445,11 +441,9 @@ impl PhaseVocoder {
                 // SYNTHESIS
                 for chan in 0..self.channels {
                     self.synthesis[chan].synthesize(
-                        self.backward_fft.as_ref(),
-                        &mut self.fft_in,
-                        &mut self.fft_out,
-                        &self.synthesis_in[chan],
-                        &self.window,
+                        &mut self.windowed_backward_fft,
+
+                        &self.synthesis_in[chan]
                     );
                 }
             }
